@@ -1123,7 +1123,13 @@ def _resolve(p: Path) -> Path:
 
 
 def upload_workbook(cfg: dict, workbook: Path) -> None:
-    """PUT the workbook to an ownCloud WebDAV endpoint (receipts stay local)."""
+    """PUT the workbook to an ownCloud WebDAV endpoint (receipts stay local).
+
+    webdav_url may be either the instance root ("https://cloud.example.com") –
+    then the classic /remote.php/dav/files/<user> prefix is used – or a full
+    DAV base already containing "/dav/" (e.g. an ocis space URL), which is
+    then used as-is. webdav_path is appended in both cases.
+    """
     base = cfg["webdav_url"]
     if not base or not cfg["webdav_user"]:
         return
@@ -1132,7 +1138,10 @@ def upload_workbook(cfg: dict, workbook: Path) -> None:
     if not segments:
         return
     quoted = [quote(s, safe="") for s in segments]
-    dav_root = f"{base}/remote.php/dav/files/{quote(user, safe='')}"
+    if "/dav/" in base:
+        dav_root = base.rstrip("/")
+    else:
+        dav_root = f"{base}/remote.php/dav/files/{quote(user, safe='')}"
     auth = (user, pw)
     for i in range(len(quoted) - 1):
         requests.request("MKCOL", dav_root + "/" + "/".join(quoted[:i + 1]),

@@ -1,0 +1,9 @@
+config.toml
+*.xlsx
+*.tmp
+receipts/
+.venv/
+__pycache__/
+.env
+data/
+.health

@@ -16,3 +16,16 @@ lookback_days = 60
 folder = "receipts"
 # Set to false to skip receipt downloads.
 download = true
+
+[webdav]
+# Optional: upload the finished workbook (without receipts) to an ownCloud /
+# WebDAV server after each run. All values can be overridden with the
+# SWKA_WEBDAV_URL / _USER / _PASSWORD / _PATH environment variables.
+url = ""        # e.g. "https://cloud.example.com" (no trailing slash)
+user = ""
+password = ""
+path = "/StudentCardTracker/spendings.xlsx"
+
+# Scrape interval for --loop mode in seconds (default 3600). Can also be set
+# via SWKA_INTERVAL_SECONDS.
+interval_seconds = 3600

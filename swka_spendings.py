@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import base64
 import json
+import logging
 import os
 import re
 import sys
@@ -15,7 +16,7 @@ import zipfile
 from collections import Counter
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from urllib.parse import unquote
+from urllib.parse import quote, unquote
 
 import requests
 import pypdfium2 as pdfium
@@ -28,6 +29,8 @@ from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
 BASE_URL = "https://autoload.sw-ka.de"
+
+log = logging.getLogger("swka")
 API_ROOT = f"{BASE_URL}/TL1/TLM/KASVC/"
 CLIENT_REG_URL = f"{BASE_URL}/TL1/TLA/ClientReg"
 BASIC_AUTH = "Basic S0FTVkM6ekt2NXlFMUxaVW12VzI5SQ=="
@@ -826,7 +829,7 @@ def download_receipts(client: KartenService, tx_rows: list[dict], folder: Path) 
             tmp.replace(path)
             stats["new"] += 1
             if stats["new"] % 25 == 0:
-                print(f"  ... {stats['new']} Bons geladen", flush=True)
+                log.info(f"  ... {stats['new']} Bons geladen")
         else:
             stats["failed"] += 1
         time.sleep(0.05)
@@ -1048,36 +1051,70 @@ def run_ocr_report(all_tx: list[dict], all_pos: list[dict], folder: Path) -> Non
             problems.append(f"{tfid}: prices {ocr_prices} != API {api_prices}")
 
     n_tx = len(all_tx)
-    print(f"[OCR-Report] parsed {parsed}/{n_tx} receipts, "
+    log.info(f"[OCR-Report] parsed {parsed}/{n_tx} receipts, "
           f"total vs Betrag ok: {total_ok}, names identical to API: {names_ok}, "
           f"prices identical: {prices_ok}")
     for line in problems[:10]:
-        print(f"  ! {line}")
+        log.info(f"  ! {line}")
     if len(problems) > 10:
-        print(f"  ... {len(problems) - 10} more problems")
+        log.info(f"  ... {len(problems) - 10} more problems")
 
 
 def load_config(path: Path, require_password: bool = True) -> dict:
-    if not path.exists():
-        sys.exit(f"config file not found: {path} (copy config.example.toml to config.toml)")
-    with path.open("rb") as fh:
-        cfg = tomllib.load(fh)
+    cfg: dict = {}
+    if path.exists():
+        with path.open("rb") as fh:
+            cfg = tomllib.load(fh)
     api = cfg.get("api", {})
     excel = cfg.get("excel", {})
     receipts = cfg.get("receipts", {})
-    karte_nr = os.environ.get("SWKA_KARTE_NR") or str(api.get("karte_nr") or "")
-    password = os.environ.get("SWKA_PASSWORD") or str(api.get("password") or "")
+    webdav = cfg.get("webdav", {})
+
+    def env_or(key: str, fallback) -> str:
+        return os.environ.get(key) or str(fallback or "")
+
+    karte_nr = env_or("SWKA_KARTE_NR", api.get("karte_nr"))
+    password = env_or("SWKA_PASSWORD", api.get("password"))
     if not karte_nr.isdigit():
-        sys.exit("config: api.karte_nr must be the numeric card number")
+        sys.exit("config: karte_nr must be the numeric card number "
+                 "(config.toml [api] or SWKA_KARTE_NR)")
     if require_password and not password:
-        sys.exit("config: api.password is missing (set it in config.toml or SWKA_PASSWORD)")
+        sys.exit("config: password is missing "
+                 "(config.toml [api] or SWKA_PASSWORD)")
+
+    def env_int(key: str, fallback, minimum: int = 0) -> int:
+        raw = os.environ.get(key) or (str(fallback) if fallback is not None else "")
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            value = 0
+        return max(minimum, value) if raw else fallback
+
+    def env_bool(key: str, fallback: bool) -> bool:
+        raw = os.environ.get(key)
+        if raw is None:
+            return fallback
+        return raw.strip().lower() not in ("0", "false", "no", "off", "")
+
     return {
         "karte_nr": karte_nr,
         "password": password,
-        "path": Path(excel.get("path") or "spendings.xlsx").expanduser(),
-        "lookback_days": int(excel.get("lookback_days") or 60),
-        "receipts_folder": Path(receipts.get("folder") or "receipts").expanduser(),
-        "receipts_download": bool(receipts.get("download", True)),
+        "path": Path(env_or("SWKA_EXCEL_PATH", excel.get("path"))
+                     or "spendings.xlsx").expanduser(),
+        "lookback_days": env_int("SWKA_LOOKBACK_DAYS", excel.get("lookback_days") or 60),
+        "receipts_folder": Path(env_or("SWKA_RECEIPTS_FOLDER", receipts.get("folder"))
+                                or "receipts").expanduser(),
+        "receipts_download": env_bool("SWKA_RECEIPTS_DOWNLOAD",
+                                      bool(receipts.get("download", True))),
+        "webdav_url": env_or("SWKA_WEBDAV_URL", webdav.get("url")).rstrip("/"),
+        "webdav_user": env_or("SWKA_WEBDAV_USER", webdav.get("user")),
+        "webdav_password": env_or("SWKA_WEBDAV_PASSWORD", webdav.get("password")),
+        "webdav_path": env_or("SWKA_WEBDAV_PATH", webdav.get("path")
+                              or "/spendings.xlsx"),
+        "interval_seconds": env_int("SWKA_INTERVAL_SECONDS",
+                                    cfg.get("interval_seconds") or 3600, 60),
+        "health_file": Path(env_or("SWKA_HEALTH_FILE", cfg.get("health_file"))
+                            or ".health").expanduser(),
     }
 
 
@@ -1085,29 +1122,35 @@ def _resolve(p: Path) -> Path:
     return p if p.is_absolute() else Path(__file__).resolve().parent / p
 
 
-def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(
-        description="Fetch KartenService transactions and append them to an Excel workbook."
-    )
-    parser.add_argument(
-        "--config",
-        type=Path,
-        default=Path(__file__).with_name("config.toml"),
-        help="path to config.toml (default: next to this script)",
-    )
-    parser.add_argument("--since", metavar="DD.MM.YYYY", help="override the start date")
-    parser.add_argument(
-        "--auth-token",
-        help="use an existing session token instead of logging in (testing)",
-    )
-    parser.add_argument(
-        "--ocr-report",
-        action="store_true",
-        help="compare receipt text extraction against API positions and print a report",
-    )
-    args = parser.parse_args(argv)
+def upload_workbook(cfg: dict, workbook: Path) -> None:
+    """PUT the workbook to an ownCloud WebDAV endpoint (receipts stay local)."""
+    base = cfg["webdav_url"]
+    if not base or not cfg["webdav_user"]:
+        return
+    user, pw = cfg["webdav_user"], cfg["webdav_password"]
+    segments = [s for s in cfg["webdav_path"].split("/") if s]
+    if not segments:
+        return
+    quoted = [quote(s, safe="") for s in segments]
+    dav_root = f"{base}/remote.php/dav/files/{quote(user, safe='')}"
+    auth = (user, pw)
+    for i in range(len(quoted) - 1):
+        requests.request("MKCOL", dav_root + "/" + "/".join(quoted[:i + 1]),
+                         auth=auth, timeout=(10, 30))
+    url = dav_root + "/" + "/".join(quoted)
+    with workbook.open("rb") as fh:
+        resp = requests.put(url, data=fh, auth=auth, timeout=(10, 120))
+    resp.raise_for_status()
+    log.info(f"[I] uploaded to WebDAV: {'/'.join(segments)}")
 
-    cfg = load_config(args.config, require_password=not args.auth_token)
+
+def touch_health(cfg: dict) -> None:
+    path = _resolve(cfg["health_file"])
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(datetime.now().isoformat())
+
+
+def run_once(cfg: dict, args) -> int:
     workbook = _resolve(cfg["path"])
     receipts_dir = _resolve(cfg["receipts_folder"])
 
@@ -1123,35 +1166,36 @@ def main(argv: list[str] | None = None) -> int:
             date_from = parse_config_date(args.since)
         except ValueError:
             sys.exit(f"invalid --since date: {args.since!r} (expected DD.MM.YYYY)")
-        print(f"[A] workbook: {workbook} | start overridden to {date_from:%d.%m.%Y}")
+        log.info(f"[A] workbook: {workbook} | start overridden to {date_from:%d.%m.%Y}")
     elif last_day:
         date_from = last_day - timedelta(days=1)
-        print(f"[A] workbook: {workbook} | last saved day {last_day:%d.%m.%Y} -> from {date_from:%d.%m.%Y}")
+        log.info(f"[A] workbook: {workbook} | last saved day {last_day:%d.%m.%Y} -> from {date_from:%d.%m.%Y}")
     else:
         date_from = date.today() - timedelta(days=cfg["lookback_days"])
-        print(f"[A] workbook: {workbook} | new file -> last {cfg['lookback_days']} days from {date_from:%d.%m.%Y}")
+        log.info(f"[A] workbook: {workbook} | new file -> last {cfg['lookback_days']} days from {date_from:%d.%m.%Y}")
 
     client = KartenService(cfg["karte_nr"], cfg["password"])
     try:
         if args.auth_token:
             client.use_token(args.auth_token)
-            print("[B] using provided auth token (login skipped)")
+            log.info("[B] using provided auth token (login skipped)")
         else:
             client.connect()
             client.login()
-            print("[B] login OK, session token acquired")
+            log.info("[B] login OK, session token acquired")
 
         earliest = date.today() - timedelta(days=client.history_days - 1)
         if date_from < earliest:
-            print(f"[A] clamped to server history limit: {earliest:%d.%m.%Y}")
+            log.info(f"[A] clamped to server history limit: {earliest:%d.%m.%Y}")
             date_from = earliest
         date_to = date.today()
         if date_from > date_to:
-            print("[C] nothing to fetch (workbook is up to date)")
+            log.info("[C] nothing to fetch (workbook is up to date)")
+            upload_workbook(cfg, workbook)
             return 0
 
         transactions, positions = client.fetch(date_from, date_to)
-        print(f"[C] fetched {len(transactions)} transactions, {len(positions)} positions "
+        log.info(f"[C] fetched {len(transactions)} transactions, {len(positions)} positions "
               f"({date_from:%d.%m.%Y} - {date_to:%d.%m.%Y})")
 
         tx_keys = {str(r.get("transFullId")) for r in tx_rows}
@@ -1171,7 +1215,7 @@ def main(argv: list[str] | None = None) -> int:
                         and str(r.get("Quelle") or "api").lower() == "ocr"
                     )
                 ]
-                print(f"[D] replaced OCR positions with API data "
+                log.info(f"[D] replaced OCR positions with API data "
                       f"for {len(replaced)} transaction(s)")
         pos_keys = {
             (str(r.get("transFullId")), int(r.get("posId") or 0)) for r in pos_rows
@@ -1194,7 +1238,7 @@ def main(argv: list[str] | None = None) -> int:
                 int(p.get("posId") or 0),
             ),
         )
-        print(f"[D] added {len(new_tx)} new transactions, {len(new_pos)} new positions "
+        log.info(f"[D] added {len(new_tx)} new transactions, {len(new_pos)} new positions "
               f"({len(transactions) - len(new_tx)} duplicates skipped)")
 
         all_tx = tx_rows + [tx_to_row(t) for t in new_tx]
@@ -1203,25 +1247,25 @@ def main(argv: list[str] | None = None) -> int:
         if cfg["receipts_download"]:
             receipt_stats = download_receipts(client, all_tx, receipts_dir)
             if "error" in receipt_stats:
-                print(f"[E] receipts failed: {receipt_stats['error']}")
+                log.info(f"[E] receipts failed: {receipt_stats['error']}")
             else:
-                print(f"[E] receipts: {receipt_stats['new']} new, "
+                log.info(f"[E] receipts: {receipt_stats['new']} new, "
                       f"{receipt_stats['have']} already present, "
                       f"{receipt_stats['failed']} failed, "
                       f"{receipt_stats['none']} without PDF -> {receipts_dir}/")
         else:
             receipt_stats = None
-            print("[E] receipts: skipped (disabled in config)")
+            log.info("[E] receipts: skipped (disabled in config)")
 
         all_pos, ocr_stats = fill_positions_from_receipts(
             all_tx, all_pos, receipts_dir
         )
         if ocr_stats["parsed"]:
-            print(f"[F] receipt text: {ocr_stats['parsed']} receipts parsed "
+            log.info(f"[F] receipt text: {ocr_stats['parsed']} receipts parsed "
                   f"({ocr_stats['items']} items), {ocr_stats['failed']} failed")
         else:
             note = (f", {ocr_stats['failed']} failed" if ocr_stats["failed"] else "")
-            print(f"[F] receipt text: no gaps to fill "
+            log.info(f"[F] receipt text: no gaps to fill "
                   f"(all transactions have API positions{note})")
         if args.ocr_report:
             run_ocr_report(all_tx, all_pos, receipts_dir)
@@ -1234,15 +1278,72 @@ def main(argv: list[str] | None = None) -> int:
         build_overview(wb, all_tx, all_pos, receipt_stats, cfg["karte_nr"],
                        str(cfg["receipts_folder"]))
         save_workbook(wb, workbook)
-        print(f"[G] saved {workbook}")
+        log.info(f"[G] saved {workbook}")
+        upload_workbook(cfg, workbook)
     except (ApiError, WorkbookError, requests.RequestException, ValueError,
             zipfile.BadZipFile, OSError) as exc:
-        print(f"error: {exc}", file=sys.stderr)
+        log.error("%s", exc)
         return 1
     finally:
         client.close()
-        print("[H] session closed")
+        log.info("[H] session closed")
     return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+        stream=sys.stdout,
+    )
+    parser = argparse.ArgumentParser(
+        description="Fetch KartenService transactions and append them to an Excel workbook."
+    )
+    parser.add_argument(
+        "--config",
+        type=Path,
+        default=Path(__file__).with_name("config.toml"),
+        help="path to config.toml (default: next to this script; env vars override)",
+    )
+    parser.add_argument("--since", metavar="DD.MM.YYYY", help="override the start date")
+    parser.add_argument(
+        "--auth-token",
+        help="use an existing session token instead of logging in (testing)",
+    )
+    parser.add_argument(
+        "--ocr-report",
+        action="store_true",
+        help="compare receipt text extraction against API positions and print a report",
+    )
+    parser.add_argument(
+        "--loop",
+        action="store_true",
+        help="run forever, scraping every interval_seconds (default 3600)",
+    )
+    args = parser.parse_args(argv)
+
+    cfg = load_config(args.config, require_password=not args.auth_token)
+
+    if not args.loop:
+        return run_once(cfg, args)
+
+    interval = cfg["interval_seconds"]
+    log.info(f"[loop] starting, scraping every {interval}s "
+          f"(health file: {_resolve(cfg['health_file'])})")
+    while True:
+        started = time.monotonic()
+        rc = run_once(cfg, args)
+        if rc == 0:
+            touch_health(cfg)
+        elapsed = time.monotonic() - started
+        wait = max(30.0, interval - elapsed)
+        log.info(f"[loop] next run in {wait:.0f}s")
+        try:
+            time.sleep(wait)
+        except KeyboardInterrupt:
+            log.info("loop stopped")
+            return 0
 
 
 if __name__ == "__main__":

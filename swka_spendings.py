@@ -112,6 +112,38 @@ _MONTH_ABBR = ["Jan", "Feb", "Mär", "Apr", "Mai", "Jun",
 _WEEKDAYS = ["Mo", "Di", "Mi", "Do", "Fr", "Sa", "So"]
 
 
+def _categorize(name: str) -> str:
+    """Map a receipt item name to a spending category."""
+    n = name.lower()
+    if "pfand" in n:
+        return "Pfand"
+    if any(k in n for k in ("getränk", "wasser", "cola", "saft", "schorle",
+                            "kaffee", "tee", "bier", "limo", "apfelsaft",
+                            "mineralwasser", "getränke")):
+        return "Getränke"
+    if any(k in n for k in ("dessert", "pudding", "kuchen", "plunder",
+                            "muffin", "brownie", "strudel", "tiramisu",
+                            "schokoladen", "vanille", "himbeer", "eisbecher",
+                            "speiseeis", "gelato")):
+        return "Dessert"
+    if any(k in n for k in ("pommes", "fritten", "frites", "chips",
+                            "kartoffelpüree", "bratkartoffel")):
+        return "Pommes & Fritten"
+    if "teller" in n and any(c.isdigit() for c in n):
+        return "Teller gewogen"
+    if any(k in n for k in ("hauptkomponente", "beilage", "reis", "nudel",
+                            "spätzle", "knödel", "salzkartoffel",
+                            "kartoffeln/reis", "baguette", "brötchen",
+                            "brot", "semmel")):
+        return "Beilage"
+    if any(k in n for k in ("salat", "obst", "gemüse", "rapkuchen")):
+        return "Salat & Obst"
+    if any(k in n for k in ("suppe", "eintopf", "gulasch", "cremesuppe")):
+        return "Suppe"
+    # Everything else that's a real food item → Hauptgericht
+    return "Hauptgericht"
+
+
 class ApiError(RuntimeError):
     pass
 
@@ -481,8 +513,15 @@ def _bar_chart(ws, anchor: str, title: str, hdr_row: int, first_row: int,
     chart.x_axis.delete = False
     chart.y_axis.delete = False
     chart.y_axis.title = "Euro"
+    # OnlyOffice needs correct axis positions: for vertical charts catAx is
+    # bottom, for horizontal charts catAx is left. openpyxl defaults to "l".
     if horizontal:
+        chart.x_axis.axPos = "l"
+        chart.y_axis.axPos = "b"
         chart.x_axis.tickLblSkip = 1
+    else:
+        chart.x_axis.axPos = "b"
+        chart.y_axis.axPos = "l"
     if show_values:
         chart.dLbls = DataLabelList()
         chart.dLbls.showVal = True
@@ -658,8 +697,8 @@ def build_overview(wb, tx_rows: list[dict], pos_rows: list[dict],
     ort_last = row - 1
     row += 1
 
-    art_spend: Counter = Counter()
-    art_qty: Counter = Counter()
+    cat_spend: Counter = Counter()
+    cat_cnt: Counter = Counter()
     for p in pos_rows:
         name = p.get("Bezeichnung")
         if not name:
@@ -670,23 +709,22 @@ def build_overview(wb, tx_rows: list[dict], pos_rows: list[dict],
             continue
         if gross <= 0:
             continue
-        key = str(name)
-        art_spend[key] += gross
-        try:
-            art_qty[key] += float(p.get("Menge") or 0)
-        except (TypeError, ValueError):
-            pass
-    top_art = sorted(art_spend.items(), key=lambda kv: -kv[1])[:10]
+        cat = _categorize(str(name))
+        if cat == "Pfand":
+            continue
+        cat_spend[cat] += gross
+        cat_cnt[cat] += 1
+    top_cats = sorted(cat_spend.items(), key=lambda kv: -kv[1])
 
-    row = _section(ws, row, "Top-Artikel nach Ausgaben")
+    row = _section(ws, row, "Ausgaben nach Kategorie")
     art_hdr = row
-    _table_header(ws, row, ["Artikel", "Ausgaben", "Menge gesamt"])
+    _table_header(ws, row, ["Kategorie", "Ausgaben", "Anzahl"])
     row += 1
     art_first = row
-    for i, (name, value) in enumerate(top_art):
+    for i, (name, value) in enumerate(top_cats):
         _table_row(
-            ws, row, [name, value, art_qty[name]],
-            [None, MONEY_FMT, QTY_FMT], band=i % 2 == 1,
+            ws, row, [name, value, cat_cnt[name]],
+            [None, MONEY_FMT, INT_FMT], band=i % 2 == 1,
         )
         row += 1
     art_last = row - 1
@@ -767,6 +805,8 @@ def build_overview(wb, tx_rows: list[dict], pos_rows: list[dict],
         line.width = 15
         line.x_axis.delete = False
         line.y_axis.delete = False
+        line.x_axis.axPos = "b"
+        line.y_axis.axPos = "l"
         line.y_axis.title = "Euro"
         ws.add_chart(line, "H4")
 
@@ -794,8 +834,8 @@ def build_overview(wb, tx_rows: list[dict], pos_rows: list[dict],
         pie.height = 7
         pie.width = 15
         ws.add_chart(pie, "H32")
-    if top_art and art_last >= art_first:
-        _bar_chart(ws, "H46", "Top-Artikel nach Ausgaben", art_hdr, art_first,
+    if top_cats and art_last >= art_first:
+        _bar_chart(ws, "H46", "Ausgaben nach Kategorie", art_hdr, art_first,
                    art_last, val_col=2, horizontal=True)
     if sum(wd_spend) > 0:
         _bar_chart(ws, "H60", "Ausgaben nach Wochentag", wd_hdr, wd_first,

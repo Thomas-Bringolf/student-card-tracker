@@ -22,6 +22,7 @@ import requests
 import pypdfium2 as pdfium
 from openpyxl import Workbook, load_workbook
 from openpyxl.chart import BarChart, LineChart, PieChart, Reference
+from openpyxl.chart.data_source import AxDataSource, StrRef
 from openpyxl.chart.label import DataLabelList
 from openpyxl.chart.shapes import GraphicalProperties
 from openpyxl.drawing.line import LineProperties
@@ -468,6 +469,10 @@ def _bar_chart(ws, anchor: str, title: str, hdr_row: int, first_row: int,
         titles_from_data=True,
     )
     chart.set_categories(Reference(ws, min_col=cat_col, min_row=first_row, max_row=last_row))
+    # OnlyOffice needs strRef for text categories (openpyxl defaults to numRef)
+    chart.series[0].cat = AxDataSource(
+        strRef=StrRef(f=f"'{ws.title}'!${get_column_letter(cat_col)}${first_row}:${get_column_letter(cat_col)}${last_row}")
+    )
     chart.series[0].graphicalProperties = GraphicalProperties(solidFill=MID)
     chart.legend = None
     chart.height = 7
@@ -777,6 +782,10 @@ def build_overview(wb, tx_rows: list[dict], pos_rows: list[dict],
             titles_from_data=True,
         )
         pie.set_categories(Reference(ws, min_col=1, min_row=ort_first, max_row=ort_last))
+        # OnlyOffice needs strRef for text categories (openpyxl defaults to numRef)
+        pie.series[0].cat = AxDataSource(
+            strRef=StrRef(f=f"'{OV_SHEET}'!$A${ort_first}:$A${ort_last}")
+        )
         pie.dataLabels = DataLabelList(
             showPercent=True, showCatName=False, showVal=False,
             showSerName=False, showLegendKey=False,

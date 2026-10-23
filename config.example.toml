@@ -1,0 +1,18 @@
+[api]
+# Kartennummer (card number, digits only) and Kennwort (password) from your
+# KartenService account. Credentials are read from SWKA_KARTE_NR /
+# SWKA_PASSWORD environment variables if set, otherwise from this file.
+karte_nr = ""
+password = ""
+
+[excel]
+# Path to the workbook (relative paths are resolved next to this script).
+path = "spendings.xlsx"
+# How far back to fetch when the workbook does not exist yet.
+lookback_days = 60
+
+[receipts]
+# Download receipt PDFs (Kassenbons) into this folder (relative to the script).
+folder = "receipts"
+# Set to false to skip receipt downloads.
+download = true
